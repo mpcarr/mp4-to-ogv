@@ -4,14 +4,97 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>MP4 → OGV Converter</title>
+
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
-    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
-    .row { display:flex; gap: 12px; align-items:center; flex-wrap: wrap; }
-    #status { white-space: pre-wrap; margin-top: 12px; }
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 16px;
+    }
+
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    button {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid #ccc;
+      cursor: pointer;
+    }
+
+    button[disabled] {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .steps {
+      margin-top: 16px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .step {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid #eee;
+      border-radius: 10px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #bbb;
+    }
+
+    .step.active .dot { background: #111; }
+    .step.done   .dot { background: #2e7d32; }
+    .step.err    .dot { background: #c62828; }
+
+    .label {
+      font-weight: 600;
+    }
+
+    .small {
+      color: #666;
+      font-size: 14px;
+    }
+
+    .barWrap {
+      margin-top: 14px;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      overflow: hidden;
+      height: 10px;
+    }
+
+    .bar {
+      height: 100%;
+      width: 0%;
+      background: #111;
+      transition: width .2s ease;
+    }
+
+    #message {
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
   </style>
 </head>
+
 <body>
   <h1>MP4 → OGV</h1>
 
@@ -20,43 +103,141 @@
       <input id="file" type="file" accept="video/mp4" />
       <button id="btn">Convert</button>
     </div>
-    <div id="status"></div>
+
+    <!-- STATUS AREA (hidden until a file is uploaded) -->
+    <div id="statusArea" style="display:none;">
+      <div class="steps" id="steps">
+        <div class="step" data-step="idle">
+          <div class="dot"></div>
+          <div>
+            <div class="label">Ready</div>
+            <div class="small">Starting conversion…</div>
+          </div>
+        </div>
+
+        <div class="step" data-step="uploading">
+          <div class="dot"></div>
+          <div>
+            <div class="label">Uploading</div>
+            <div class="small" id="uploadText">Uploading file…</div>
+          </div>
+        </div>
+
+        <div class="step" data-step="converting">
+          <div class="dot"></div>
+          <div>
+            <div class="label">Converting</div>
+            <div class="small">FFmpeg is converting the video…</div>
+          </div>
+        </div>
+
+        <div class="step" data-step="downloading">
+          <div class="dot"></div>
+          <div>
+            <div class="label">Preparing download</div>
+            <div class="small">Finalising output…</div>
+          </div>
+        </div>
+
+        <div class="step" data-step="done">
+          <div class="dot"></div>
+          <div>
+            <div class="label">Done</div>
+            <div class="small">Your download should start automatically.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="barWrap">
+        <div class="bar" id="bar"></div>
+      </div>
+
+      <div id="message"></div>
+    </div>
   </div>
 
   <script>
     const fileEl = document.getElementById("file");
     const btn = document.getElementById("btn");
-    const statusEl = document.getElementById("status");
+    const statusArea = document.getElementById("statusArea");
+    const stepsEl = document.getElementById("steps");
+    const barEl = document.getElementById("bar");
+    const msgEl = document.getElementById("message");
+    const uploadTextEl = document.getElementById("uploadText");
+
+    function setStep(stepName, state) {
+      const el = stepsEl.querySelector(`.step[data-step="${stepName}"]`);
+      if (!el) return;
+      el.classList.remove("active", "done", "err");
+      if (state === "active") el.classList.add("active");
+      if (state === "done") el.classList.add("done");
+      if (state === "err") el.classList.add("err");
+    }
+
+    function resetSteps() {
+      ["idle","uploading","converting","downloading","done"].forEach(s => setStep(s, ""));
+      setStep("idle", "active");
+      barEl.style.width = "0%";
+      msgEl.textContent = "";
+    }
+
+    function xhrUpload(url, formData, { onProgress } = {}) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", url, true);
+        xhr.responseType = "blob";
+
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable && onProgress) {
+            onProgress(e.loaded, e.total);
+          }
+        };
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(xhr.response);
+          } else {
+            reject(new Error(`Request failed (${xhr.status})`));
+          }
+        };
+
+        xhr.onerror = () => reject(new Error("Network error"));
+        xhr.send(formData);
+      });
+    }
 
     btn.addEventListener("click", async () => {
-      statusEl.textContent = "";
       const file = fileEl.files?.[0];
-      if (!file) {
-        statusEl.textContent = "Pick an MP4 file first.";
-        return;
-      }
+      if (!file) return;
 
+      statusArea.style.display = "block";
+      resetSteps();
       btn.disabled = true;
-      statusEl.textContent = "Uploading and converting...";
+
+      setStep("uploading", "active");
+      uploadTextEl.textContent =
+        `Uploading ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`;
 
       try {
         const fd = new FormData();
         fd.append("file", file);
 
-        const res = await fetch("/convert", { method: "POST", body: fd });
+        const blob = await xhrUpload("/convert", fd, {
+          onProgress: (loaded, total) => {
+            const pct = total ? loaded / total : 0;
+            barEl.style.width = `${Math.round(pct * 60)}%`;
+          }
+        });
 
-        if (!res.ok) {
-          let msg = "Conversion failed.";
-          try {
-            const j = await res.json();
-            if (j.detail) msg = j.detail;
-          } catch {}
-          throw new Error(msg);
-        }
+        setStep("uploading", "done");
+        setStep("converting", "active");
+        barEl.style.width = "75%";
 
-        const blob = await res.blob();
+        setStep("converting", "done");
+        setStep("downloading", "active");
+        barEl.style.width = "90%";
+
         const url = URL.createObjectURL(blob);
-
         const a = document.createElement("a");
         a.href = url;
         a.download = "converted.ogv";
@@ -64,10 +245,14 @@
         a.click();
         a.remove();
 
-        statusEl.textContent = "Done! Your download should have started.";
+        setStep("downloading", "done");
+        setStep("done", "active");
+        barEl.style.width = "100%";
+        msgEl.textContent = "Conversion complete.";
+
         setTimeout(() => URL.revokeObjectURL(url), 5000);
       } catch (e) {
-        statusEl.textContent = String(e.message || e);
+        msgEl.textContent = e.message || "Conversion failed.";
       } finally {
         btn.disabled = false;
       }
