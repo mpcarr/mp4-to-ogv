@@ -1,3 +1,4 @@
+<!-- static/index.html -->
 <!doctype html>
 <html>
 <head>
@@ -55,7 +56,6 @@
       <button id="btn">Convert</button>
     </div>
 
-    <!-- hidden until conversion starts -->
     <div id="statusArea" style="display:none;">
       <div class="steps" id="steps">
         <div class="step" data-step="uploading">
@@ -151,7 +151,6 @@
       convertTextEl.textContent = "Starting…";
     }
 
-    // Upload with progress (XHR supports upload progress)
     function xhrPostForm(url, formData, { onProgress } = {}) {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
@@ -191,14 +190,11 @@
 
       statusArea.style.display = "block";
       resetUI();
-
       btn.disabled = true;
 
       uploadTextEl.textContent = `Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)…`;
-      convertTextEl.textContent = `FFmpeg will convert at quality ${qualityEl.value}/10…`;
 
       try {
-        // 1) Create job (upload mp4)
         const fd = new FormData();
         fd.append("file", file);
         fd.append("quality", qualityEl.value);
@@ -206,8 +202,7 @@
         const resp = await xhrPostForm("/jobs", fd, {
           onProgress: (loaded, total) => {
             const pct = total ? (loaded / total) : 0;
-            // Upload occupies 0–20% of the bar
-            barEl.style.width = `${Math.round(pct * 20)}%`;
+            barEl.style.width = `${Math.round(pct * 20)}%`; // upload 0–20%
           }
         });
 
@@ -217,39 +212,37 @@
         setStep("queued", "active");
         barEl.style.width = "20%";
 
-        // 2) Subscribe to SSE progress
-        let es = new EventSource(`/jobs/${jobId}/events`);
+        const es = new EventSource(`/jobs/${jobId}/events`);
+        let hasStartedProcessing = false;
 
         es.onmessage = async (evt) => {
           const data = JSON.parse(evt.data);
 
-          // queued status with queue position
+          // Ignore stale queued events if processing has started
           if (data.type === "status" && data.status === "queued") {
+            if (hasStartedProcessing) return;
+
             const pos = data.queue_pos || 0;
             if (pos > 0) {
               queueBadgeEl.style.display = "inline-block";
               queueBadgeEl.textContent = `Position ${pos}`;
-              queueTextEl.textContent = pos === 1
-                ? "You’re next…"
-                : "Waiting for your turn…";
+              queueTextEl.textContent = pos === 1 ? "You’re next…" : "Waiting for your turn…";
             }
           }
 
-          // started processing
           if (data.type === "status" && data.status === "processing") {
+            hasStartedProcessing = true;
             setStep("queued", "done");
             setStep("converting", "active");
             convertTextEl.textContent = "Converting… 0%";
-            // Hold bar at ~20% until progress updates
             barEl.style.width = "22%";
           }
 
           if (data.type === "progress") {
-            const p = Math.max(0, Math.min(100, data.percent || 0));
+            hasStartedProcessing = true;
+            const p = Math.max(0, Math.min(99, data.percent || 0)); // should be 0..99 until done
             convertTextEl.textContent = `Converting… ${p}%`;
-
-            // Conversion occupies 20–90% of the bar
-            const barPct = 20 + Math.round((p / 100) * 70);
+            const barPct = 20 + Math.round((p / 100) * 70); // convert 20–90%
             barEl.style.width = `${barPct}%`;
           }
 
@@ -260,14 +253,15 @@
             barEl.style.width = "95%";
 
             const blob = await downloadBlob(`/jobs/${jobId}/download`);
-
             const url = URL.createObjectURL(blob);
+
             const a = document.createElement("a");
             a.href = url;
             a.download = "converted.ogv";
             document.body.appendChild(a);
             a.click();
             a.remove();
+
             setTimeout(() => URL.revokeObjectURL(url), 5000);
 
             setStep("downloading", "done");
@@ -288,7 +282,7 @@
         };
 
         es.onerror = () => {
-          // If connection drops, user can retry; avoid spamming UI.
+          // avoid noisy UI; user can retry if needed
         };
 
       } catch (e) {

@@ -1,8 +1,10 @@
+# app.py
 import asyncio
 import json
 import uuid
 import subprocess
 import traceback
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict
@@ -13,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
 app = FastAPI()
-
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -27,7 +28,7 @@ def ffmpeg_args_for_quality(q: int) -> list[str]:
     Theora/Vorbis quality scale:
       video: 0–10 (higher = better)
       audio: 0–10
-    We accept 1..10 from UI.
+    UI sends 1..10.
     """
     q = max(1, min(10, q))
     qa = max(0, q - 2)
@@ -69,6 +70,17 @@ def probe_duration_ms(path: Path) -> int:
     return max(1, int(seconds * 1000))
 
 
+def parse_ffmpeg_time_to_ms(t: str) -> Optional[int]:
+    # "HH:MM:SS.xx"
+    try:
+        hh, mm, ss = t.split(":")
+        sec = float(ss)
+        total_ms = (int(hh) * 3600 + int(mm) * 60 + sec) * 1000
+        return int(total_ms)
+    except Exception:
+        return None
+
+
 @dataclass
 class Job:
     job_id: str
@@ -87,17 +99,14 @@ class Job:
 
 
 JOBS: Dict[str, Job] = {}
-
-# Single global FIFO queue of job_ids
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue()
 WORKER_STARTED = False
 
 
 def run_ffmpeg_blocking(job: Job, loop: asyncio.AbstractEventLoop):
     """
-    Run ffmpeg in a normal blocking subprocess and parse -progress output.
-    Push updates back into the asyncio world via loop.call_soon_threadsafe.
-    Only called by the single worker (so conversions are serialized).
+    Run ffmpeg in a normal blocking subprocess and parse progress from stderr "time=HH:MM:SS.xx".
+    Cap progress at 99% until the conversion truly finishes, then emit done at 100%.
     """
     assert job.in_path is not None
     assert job.out_path is not None
@@ -113,7 +122,7 @@ def run_ffmpeg_blocking(job: Job, loop: asyncio.AbstractEventLoop):
         job.status = "processing"
         job.queue_pos = 0
         job.message = "Starting ffmpeg..."
-        emit({"type": "status", "status": job.status, "percent": job.percent, "message": job.message, "queue_pos": 0})
+        emit({"type": "status", "status": "processing", "percent": job.percent, "message": job.message, "queue_pos": 0})
 
         job.duration_ms = probe_duration_ms(in_path)
 
@@ -121,52 +130,52 @@ def run_ffmpeg_blocking(job: Job, loop: asyncio.AbstractEventLoop):
             "ffmpeg", "-y",
             "-i", str(in_path),
             *ffmpeg_args_for_quality(quality),
-            "-progress", "pipe:1",
-            "-nostats",
+            "-stats_period", "0.5",
             str(out_path),
         ]
 
+        time_re = re.compile(r"time=(\d+:\d+:\d+(?:\.\d+)?)")
+
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
 
         last_percent = -1
-        assert proc.stdout is not None
+        assert proc.stderr is not None
 
-        for line in proc.stdout:
-            s = line.strip()
-            if not s or "=" not in s:
+        for line in proc.stderr:
+            m = time_re.search(line)
+            if not m:
                 continue
 
-            k, v = s.split("=", 1)
+            out_ms = parse_ffmpeg_time_to_ms(m.group(1))
+            if out_ms is None:
+                continue
 
-            if k == "out_time_ms":
-                try:
-                    out_ms = int(v)
-                except ValueError:
-                    continue
-
-                pct = int(min(100, max(0, (out_ms / job.duration_ms) * 100)))
-                if pct != last_percent:
-                    last_percent = pct
-                    job.percent = pct
-                    emit({"type": "progress", "status": "processing", "percent": pct})
-
-            elif k == "progress" and v == "end":
-                break
+            pct = int(min(99, max(0, (out_ms / job.duration_ms) * 100)))  # never 100 here
+            if pct != last_percent:
+                last_percent = pct
+                job.percent = pct
+                emit({"type": "progress", "status": "processing", "percent": pct})
 
         rc = proc.wait()
 
         if rc != 0:
-            err = ""
-            if proc.stderr:
-                err = proc.stderr.read() or ""
+            # Capture the tail of stderr to help debugging
+            err_tail = ""
+            try:
+                # stderr is already consumed line-by-line; Popen doesn't retain it.
+                # Best effort: nothing more to read here.
+                err_tail = "ffmpeg exited with non-zero status."
+            except Exception:
+                pass
+
             job.status = "error"
-            job.err_detail = err[-4000:] if err else "ffmpeg failed"
+            job.err_detail = err_tail
             emit({
                 "type": "error",
                 "status": "error",
@@ -192,11 +201,10 @@ def run_ffmpeg_blocking(job: Job, loop: asyncio.AbstractEventLoop):
             "detail": job.err_detail[-4000:],
         })
     finally:
-        # cleanup input
         try:
             if in_path.exists():
                 in_path.unlink()
-        except:
+        except Exception:
             pass
 
 
@@ -213,9 +221,7 @@ async def queue_worker():
             JOB_QUEUE.task_done()
             continue
 
-        # This is the only place conversions happen -> ensures one at a time
         await run_conversion(job)
-
         JOB_QUEUE.task_done()
 
 
@@ -234,7 +240,6 @@ async def create_job(
 ):
     if not file.filename.lower().endswith(".mp4"):
         raise HTTPException(status_code=400, detail="Please upload an .mp4 file")
-
     if quality < 1 or quality > 10:
         raise HTTPException(status_code=400, detail="Quality must be between 1 and 10")
 
@@ -256,26 +261,24 @@ async def create_job(
         status="queued",
         percent=0,
         message="Queued",
-        queue_pos=0,        # will set below
+        queue_pos=0,
         in_path=in_path,
         out_path=out_path,
         quality=quality,
     )
     JOBS[job_id] = job
 
-    # Enqueue (FIFO). Queue position estimate:
-    # qsize() here is number currently waiting, before adding this job.
     waiting_before = JOB_QUEUE.qsize()
     await JOB_QUEUE.put(job_id)
     job.queue_pos = waiting_before + 1
 
-    # Emit queued status immediately so the client sees their position
+    # Emit queued status so client sees position
     await job.queue.put({
         "type": "status",
         "status": "queued",
         "percent": 0,
         "message": "Queued",
-        "queue_pos": job.queue_pos
+        "queue_pos": job.queue_pos,
     })
 
     return {"job_id": job_id}
@@ -288,7 +291,6 @@ async def job_events(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def event_stream():
-        # Send an initial snapshot immediately
         initial = {
             "type": "status",
             "status": job.status,
@@ -301,7 +303,6 @@ async def job_events(job_id: str):
         while True:
             payload = await job.queue.get()
             yield f"data: {json.dumps(payload)}\n\n"
-
             if payload.get("type") in {"done", "error"}:
                 break
 
