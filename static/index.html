@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MP4 → OGV Converter</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    .row { display:flex; gap: 12px; align-items:center; flex-wrap: wrap; }
+    #status { white-space: pre-wrap; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>MP4 → OGV</h1>
+
+  <div class="card">
+    <div class="row">
+      <input id="file" type="file" accept="video/mp4" />
+      <button id="btn">Convert</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const fileEl = document.getElementById("file");
+    const btn = document.getElementById("btn");
+    const statusEl = document.getElementById("status");
+
+    btn.addEventListener("click", async () => {
+      statusEl.textContent = "";
+      const file = fileEl.files?.[0];
+      if (!file) {
+        statusEl.textContent = "Pick an MP4 file first.";
+        return;
+      }
+
+      btn.disabled = true;
+      statusEl.textContent = "Uploading and converting...";
+
+      try {
+        const fd = new FormData();
+        fd.append("file", file);
+
+        const res = await fetch("/convert", { method: "POST", body: fd });
+
+        if (!res.ok) {
+          let msg = "Conversion failed.";
+          try {
+            const j = await res.json();
+            if (j.detail) msg = j.detail;
+          } catch {}
+          throw new Error(msg);
+        }
+
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "converted.ogv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        statusEl.textContent = "Done! Your download should have started.";
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      } catch (e) {
+        statusEl.textContent = String(e.message || e);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
