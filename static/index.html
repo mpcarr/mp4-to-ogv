@@ -6,91 +6,35 @@
   <title>MP4 → OGV Converter</title>
 
   <style>
-    body {
-      font-family: system-ui, sans-serif;
-      max-width: 720px;
-      margin: 40px auto;
-      padding: 0 16px;
-    }
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    .row { display:flex; gap: 12px; align-items:center; flex-wrap: wrap; }
+    input[type="file"], input[type="range"] { padding: 8px 10px; border-radius: 10px; border: 1px solid #ccc; }
 
-    .card {
-      border: 1px solid #ddd;
-      border-radius: 12px;
-      padding: 16px;
-    }
-
-    button {
-      padding: 10px 14px;
-      border-radius: 10px;
-      border: 1px solid #ccc;
-      cursor: pointer;
-    }
-
-    button[disabled] {
-      opacity: .6;
-      cursor: not-allowed;
-    }
-
-    .row {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .steps {
-      margin-top: 16px;
-      display: grid;
-      gap: 8px;
-    }
-
-    .step {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
-      border: 1px solid #eee;
-      border-radius: 10px;
-    }
-
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #bbb;
-    }
-
+    .steps { margin-top: 16px; display: grid; gap: 8px; }
+    .step { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #eee; border-radius: 10px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #bbb; }
     .step.active .dot { background: #111; }
     .step.done   .dot { background: #2e7d32; }
     .step.err    .dot { background: #c62828; }
+    .label { font-weight: 600; }
+    .small { color: #666; font-size: 14px; }
 
-    .label {
-      font-weight: 600;
-    }
+    .barWrap { margin-top: 14px; border: 1px solid #eee; border-radius: 10px; overflow: hidden; height: 10px; }
+    .bar { height: 100%; width: 0%; background: #111; transition: width .15s ease; }
 
-    .small {
-      color: #666;
-      font-size: 14px;
-    }
+    #message { margin-top: 12px; white-space: pre-wrap; }
 
-    .barWrap {
-      margin-top: 14px;
-      border: 1px solid #eee;
-      border-radius: 10px;
-      overflow: hidden;
-      height: 10px;
-    }
-
-    .bar {
-      height: 100%;
-      width: 0%;
-      background: #111;
-      transition: width .2s ease;
-    }
-
-    #message {
-      margin-top: 12px;
-      white-space: pre-wrap;
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border: 1px solid #ccc;
+      border-radius: 999px;
+      font-size: 12px;
+      color: #333;
+      margin-left: 8px;
     }
   </style>
 </head>
@@ -101,20 +45,19 @@
   <div class="card">
     <div class="row">
       <input id="file" type="file" accept="video/mp4" />
+
+      <label class="small" style="font-weight:600;">
+        Quality: <span id="qualityVal">7</span>/10
+      </label>
+
+      <input id="quality" type="range" min="1" max="10" step="1" value="7" />
+
       <button id="btn">Convert</button>
     </div>
 
-    <!-- STATUS AREA (hidden until a file is uploaded) -->
+    <!-- hidden until conversion starts -->
     <div id="statusArea" style="display:none;">
       <div class="steps" id="steps">
-        <div class="step" data-step="idle">
-          <div class="dot"></div>
-          <div>
-            <div class="label">Ready</div>
-            <div class="small">Starting conversion…</div>
-          </div>
-        </div>
-
         <div class="step" data-step="uploading">
           <div class="dot"></div>
           <div>
@@ -123,11 +66,22 @@
           </div>
         </div>
 
+        <div class="step" data-step="queued">
+          <div class="dot"></div>
+          <div>
+            <div class="label">
+              In queue
+              <span class="badge" id="queueBadge" style="display:none;"></span>
+            </div>
+            <div class="small" id="queueText">Waiting for your turn…</div>
+          </div>
+        </div>
+
         <div class="step" data-step="converting">
           <div class="dot"></div>
           <div>
             <div class="label">Converting</div>
-            <div class="small">FFmpeg is converting the video…</div>
+            <div class="small" id="convertText">Starting…</div>
           </div>
         </div>
 
@@ -135,7 +89,7 @@
           <div class="dot"></div>
           <div>
             <div class="label">Preparing download</div>
-            <div class="small">Finalising output…</div>
+            <div class="small">Getting the converted file…</div>
           </div>
         </div>
 
@@ -158,12 +112,24 @@
 
   <script>
     const fileEl = document.getElementById("file");
+    const qualityEl = document.getElementById("quality");
+    const qualityValEl = document.getElementById("qualityVal");
     const btn = document.getElementById("btn");
+
     const statusArea = document.getElementById("statusArea");
     const stepsEl = document.getElementById("steps");
     const barEl = document.getElementById("bar");
     const msgEl = document.getElementById("message");
+
     const uploadTextEl = document.getElementById("uploadText");
+    const queueTextEl = document.getElementById("queueText");
+    const queueBadgeEl = document.getElementById("queueBadge");
+    const convertTextEl = document.getElementById("convertText");
+
+    qualityValEl.textContent = qualityEl.value;
+    qualityEl.addEventListener("input", () => {
+      qualityValEl.textContent = qualityEl.value;
+    });
 
     function setStep(stepName, state) {
       const el = stepsEl.querySelector(`.step[data-step="${stepName}"]`);
@@ -174,31 +140,31 @@
       if (state === "err") el.classList.add("err");
     }
 
-    function resetSteps() {
-      ["idle","uploading","converting","downloading","done"].forEach(s => setStep(s, ""));
-      setStep("idle", "active");
+    function resetUI() {
+      ["uploading","queued","converting","downloading","done"].forEach(s => setStep(s, ""));
+      setStep("uploading", "active");
       barEl.style.width = "0%";
       msgEl.textContent = "";
+      queueBadgeEl.style.display = "none";
+      queueBadgeEl.textContent = "";
+      queueTextEl.textContent = "Waiting for your turn…";
+      convertTextEl.textContent = "Starting…";
     }
 
-    function xhrUpload(url, formData, { onProgress } = {}) {
+    // Upload with progress (XHR supports upload progress)
+    function xhrPostForm(url, formData, { onProgress } = {}) {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", url, true);
-        xhr.responseType = "blob";
+        xhr.responseType = "json";
 
         xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable && onProgress) {
-            onProgress(e.loaded, e.total);
-          }
+          if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
         };
 
         xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            resolve(xhr.response);
-          } else {
-            reject(new Error(`Request failed (${xhr.status})`));
-          }
+          if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+          else reject(new Error((xhr.response && xhr.response.detail) || `Request failed (${xhr.status})`));
         };
 
         xhr.onerror = () => reject(new Error("Network error"));
@@ -206,54 +172,128 @@
       });
     }
 
+    async function downloadBlob(url) {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let msg = `Download failed (${res.status})`;
+        try {
+          const j = await res.json();
+          if (j.detail) msg = j.detail;
+        } catch {}
+        throw new Error(msg);
+      }
+      return await res.blob();
+    }
+
     btn.addEventListener("click", async () => {
       const file = fileEl.files?.[0];
       if (!file) return;
 
       statusArea.style.display = "block";
-      resetSteps();
+      resetUI();
+
       btn.disabled = true;
 
-      setStep("uploading", "active");
-      uploadTextEl.textContent =
-        `Uploading ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)…`;
+      uploadTextEl.textContent = `Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)…`;
+      convertTextEl.textContent = `FFmpeg will convert at quality ${qualityEl.value}/10…`;
 
       try {
+        // 1) Create job (upload mp4)
         const fd = new FormData();
         fd.append("file", file);
+        fd.append("quality", qualityEl.value);
 
-        const blob = await xhrUpload("/convert", fd, {
+        const resp = await xhrPostForm("/jobs", fd, {
           onProgress: (loaded, total) => {
-            const pct = total ? loaded / total : 0;
-            barEl.style.width = `${Math.round(pct * 60)}%`;
+            const pct = total ? (loaded / total) : 0;
+            // Upload occupies 0–20% of the bar
+            barEl.style.width = `${Math.round(pct * 20)}%`;
           }
         });
 
+        const jobId = resp.job_id;
+
         setStep("uploading", "done");
-        setStep("converting", "active");
-        barEl.style.width = "75%";
+        setStep("queued", "active");
+        barEl.style.width = "20%";
 
-        setStep("converting", "done");
-        setStep("downloading", "active");
-        barEl.style.width = "90%";
+        // 2) Subscribe to SSE progress
+        let es = new EventSource(`/jobs/${jobId}/events`);
 
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "converted.ogv";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+        es.onmessage = async (evt) => {
+          const data = JSON.parse(evt.data);
 
-        setStep("downloading", "done");
-        setStep("done", "active");
-        barEl.style.width = "100%";
-        msgEl.textContent = "Conversion complete.";
+          // queued status with queue position
+          if (data.type === "status" && data.status === "queued") {
+            const pos = data.queue_pos || 0;
+            if (pos > 0) {
+              queueBadgeEl.style.display = "inline-block";
+              queueBadgeEl.textContent = `Position ${pos}`;
+              queueTextEl.textContent = pos === 1
+                ? "You’re next…"
+                : "Waiting for your turn…";
+            }
+          }
 
-        setTimeout(() => URL.revokeObjectURL(url), 5000);
+          // started processing
+          if (data.type === "status" && data.status === "processing") {
+            setStep("queued", "done");
+            setStep("converting", "active");
+            convertTextEl.textContent = "Converting… 0%";
+            // Hold bar at ~20% until progress updates
+            barEl.style.width = "22%";
+          }
+
+          if (data.type === "progress") {
+            const p = Math.max(0, Math.min(100, data.percent || 0));
+            convertTextEl.textContent = `Converting… ${p}%`;
+
+            // Conversion occupies 20–90% of the bar
+            const barPct = 20 + Math.round((p / 100) * 70);
+            barEl.style.width = `${barPct}%`;
+          }
+
+          if (data.type === "done") {
+            es.close();
+            setStep("converting", "done");
+            setStep("downloading", "active");
+            barEl.style.width = "95%";
+
+            const blob = await downloadBlob(`/jobs/${jobId}/download`);
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "converted.ogv";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+            setStep("downloading", "done");
+            setStep("done", "active");
+            barEl.style.width = "100%";
+            msgEl.textContent = "Conversion complete.";
+            btn.disabled = false;
+          }
+
+          if (data.type === "error") {
+            es.close();
+            setStep("converting", "err");
+            msgEl.textContent = data.detail
+              ? `Conversion failed:\n${data.detail}`
+              : (data.message || "Conversion failed.");
+            btn.disabled = false;
+          }
+        };
+
+        es.onerror = () => {
+          // If connection drops, user can retry; avoid spamming UI.
+        };
+
       } catch (e) {
-        msgEl.textContent = e.message || "Conversion failed.";
-      } finally {
+        setStep("uploading", "err");
+        msgEl.textContent = String(e.message || e);
         btn.disabled = false;
       }
     });
