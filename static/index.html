@@ -181,7 +181,19 @@
         } catch {}
         throw new Error(msg);
       }
-      return await res.blob();
+
+      // Try to read filename from Content-Disposition
+      let filename = "download.ogv";
+      const cd = res.headers.get("Content-Disposition");
+      if (cd) {
+        const match = cd.match(/filename="?([^"]+)"?/i);
+        if (match && match[1]) {
+          filename = match[1];
+        }
+      }
+
+      const blob = await res.blob();
+      return { blob, filename };
     }
 
     btn.addEventListener("click", async () => {
@@ -252,12 +264,11 @@
             setStep("downloading", "active");
             barEl.style.width = "95%";
 
-            const blob = await downloadBlob(`/jobs/${jobId}/download`);
+            const { blob, filename } = await downloadBlob(`/jobs/${jobId}/download`);
             const url = URL.createObjectURL(blob);
-
             const a = document.createElement("a");
             a.href = url;
-            a.download = "converted.ogv";
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             a.remove();

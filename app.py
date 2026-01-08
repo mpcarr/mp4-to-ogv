@@ -1,27 +1,72 @@
-# app.py
 import asyncio
 import json
 import uuid
 import subprocess
 import traceback
 import re
+import sys
+import threading
+import time
+import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
+# ---------------------------------------------------------------------------
+# PyInstaller helpers
+# ---------------------------------------------------------------------------
+
+def resource_path(*parts: str) -> Path:
+    """
+    Get absolute path to resource (works in dev + PyInstaller onefile).
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    else:
+        base = Path(__file__).parent
+    return base.joinpath(*parts)
+
+
+def resolve_ffmpeg_binaries():
+    """
+    Use bundled ffmpeg if running from PyInstaller,
+    otherwise rely on system ffmpeg.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+        return (
+            str(base / "ffmpeg" / "ffmpeg.exe"),
+            str(base / "ffmpeg" / "ffprobe.exe"),
+        )
+    return "ffmpeg", "ffprobe"
+
+
+FFMPEG_BIN, FFPROBE_BIN = resolve_ffmpeg_binaries()
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Static files (optional; for completeness)
+static_dir = resource_path("static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return Path("static/index.html").read_text(encoding="utf-8")
+    return resource_path("static", "index.html").read_text(encoding="utf-8")
 
+# ---------------------------------------------------------------------------
+# FFmpeg helpers
+# ---------------------------------------------------------------------------
 
 def ffmpeg_args_for_quality(q: int) -> list[str]:
     """
@@ -41,45 +86,32 @@ def ffmpeg_args_for_quality(q: int) -> list[str]:
 
 
 def probe_duration_ms(path: Path) -> int:
-    """
-    Return duration in milliseconds using ffprobe JSON output.
-    """
     cmd = [
-        "ffprobe",
+        FFPROBE_BIN,
         "-v", "error",
         "-print_format", "json",
         "-show_format",
         "-show_entries", "format=duration",
         str(path),
     ]
-    try:
-        raw = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore")
-    except FileNotFoundError:
-        raise RuntimeError("ffprobe not found. Is ffmpeg/ffprobe installed and on PATH?")
-    except subprocess.CalledProcessError as e:
-        msg = (e.output or b"").decode("utf-8", errors="ignore")
-        raise RuntimeError(f"ffprobe failed: {msg[-2000:]}")
-
+    raw = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore")
     data = json.loads(raw)
-    dur = data.get("format", {}).get("duration", None)
-    if dur is None:
-        raise RuntimeError("ffprobe returned no duration.")
-    seconds = float(dur)
-    if seconds <= 0:
-        raise RuntimeError(f"ffprobe duration invalid: {dur}")
-    return max(1, int(seconds * 1000))
+    dur = data.get("format", {}).get("duration")
+    if not dur:
+        raise RuntimeError("Could not determine duration")
+    return max(1, int(float(dur) * 1000))
 
 
 def parse_ffmpeg_time_to_ms(t: str) -> Optional[int]:
-    # "HH:MM:SS.xx"
     try:
         hh, mm, ss = t.split(":")
-        sec = float(ss)
-        total_ms = (int(hh) * 3600 + int(mm) * 60 + sec) * 1000
-        return int(total_ms)
+        return int((int(hh) * 3600 + int(mm) * 60 + float(ss)) * 1000)
     except Exception:
         return None
 
+# ---------------------------------------------------------------------------
+# Job model + queue
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Job:
@@ -87,51 +119,80 @@ class Job:
     status: str = "queued"          # queued | processing | done | error
     percent: int = 0               # 0..100
     message: str = "Queued"
-    queue_pos: int = 0             # 1..N while queued, 0 once processing
+    queue_pos: int = 0
+    in_path: Optional[Path] = None
     out_path: Optional[Path] = None
+    quality: int = 7
     err_detail: Optional[str] = None
     duration_ms: int = 1
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
-    # required for worker
-    in_path: Optional[Path] = None
-    quality: int = 7
+    # For download naming
+    original_stem: str = "converted"
 
 
 JOBS: Dict[str, Job] = {}
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue()
 WORKER_STARTED = False
 
+# ---------------------------------------------------------------------------
+# Cleanup helpers
+# ---------------------------------------------------------------------------
+
+def cleanup_job_files(job_id: str):
+    """
+    Delete input/output files and forget the job.
+    Called after download completes (BackgroundTasks).
+    """
+    job = JOBS.pop(job_id, None)
+    if not job:
+        return
+
+    try:
+        if job.in_path and job.in_path.exists():
+            job.in_path.unlink()
+    except Exception:
+        pass
+
+    try:
+        if job.out_path and job.out_path.exists():
+            job.out_path.unlink()
+    except Exception:
+        pass
+
+    # If tmp folder is empty, optionally remove it (best-effort)
+    try:
+        tmp_dir = Path.cwd() / "tmp"
+        if tmp_dir.exists() and tmp_dir.is_dir():
+            if not any(tmp_dir.iterdir()):
+                tmp_dir.rmdir()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Conversion worker
+# ---------------------------------------------------------------------------
 
 def run_ffmpeg_blocking(job: Job, loop: asyncio.AbstractEventLoop):
-    """
-    Run ffmpeg in a normal blocking subprocess and parse progress from stderr "time=HH:MM:SS.xx".
-    Cap progress at 99% until the conversion truly finishes, then emit done at 100%.
-    """
-    assert job.in_path is not None
-    assert job.out_path is not None
-
-    in_path = job.in_path
-    out_path = job.out_path
-    quality = job.quality
-
     def emit(payload: dict):
         loop.call_soon_threadsafe(job.queue.put_nowait, payload)
 
     try:
         job.status = "processing"
         job.queue_pos = 0
-        job.message = "Starting ffmpeg..."
-        emit({"type": "status", "status": "processing", "percent": job.percent, "message": job.message, "queue_pos": 0})
+        emit({"type": "status", "status": "processing", "percent": 0})
 
-        job.duration_ms = probe_duration_ms(in_path)
+        if not job.in_path or not job.out_path:
+            raise RuntimeError("Job missing input/output path")
+
+        job.duration_ms = probe_duration_ms(job.in_path)
 
         cmd = [
-            "ffmpeg", "-y",
-            "-i", str(in_path),
-            *ffmpeg_args_for_quality(quality),
+            FFMPEG_BIN, "-y",
+            "-i", str(job.in_path),
+            *ffmpeg_args_for_quality(job.quality),
             "-stats_period", "0.5",
-            str(out_path),
+            str(job.out_path),
         ]
 
         time_re = re.compile(r"time=(\d+:\d+:\d+(?:\.\d+)?)")
@@ -144,68 +205,42 @@ def run_ffmpeg_blocking(job: Job, loop: asyncio.AbstractEventLoop):
             bufsize=1,
         )
 
-        last_percent = -1
-        assert proc.stderr is not None
+        last_pct = -1
+        if proc.stderr:
+            for line in proc.stderr:
+                m = time_re.search(line)
+                if not m:
+                    continue
+                out_ms = parse_ffmpeg_time_to_ms(m.group(1))
+                if out_ms is None:
+                    continue
 
-        for line in proc.stderr:
-            m = time_re.search(line)
-            if not m:
-                continue
-
-            out_ms = parse_ffmpeg_time_to_ms(m.group(1))
-            if out_ms is None:
-                continue
-
-            pct = int(min(99, max(0, (out_ms / job.duration_ms) * 100)))  # never 100 here
-            if pct != last_percent:
-                last_percent = pct
-                job.percent = pct
-                emit({"type": "progress", "status": "processing", "percent": pct})
+                pct = int(min(99, max(0, (out_ms / job.duration_ms) * 100)))
+                if pct != last_pct:
+                    last_pct = pct
+                    job.percent = pct
+                    emit({"type": "progress", "status": "processing", "percent": pct})
 
         rc = proc.wait()
-
         if rc != 0:
-            # Capture the tail of stderr to help debugging
-            err_tail = ""
-            try:
-                # stderr is already consumed line-by-line; Popen doesn't retain it.
-                # Best effort: nothing more to read here.
-                err_tail = "ffmpeg exited with non-zero status."
-            except Exception:
-                pass
-
             job.status = "error"
-            job.err_detail = err_tail
-            emit({
-                "type": "error",
-                "status": "error",
-                "percent": job.percent,
-                "message": "ffmpeg failed",
-                "detail": job.err_detail,
-            })
+            job.err_detail = f"ffmpeg exited with code {rc}"
+            emit({"type": "error", "status": "error", "percent": job.percent, "detail": job.err_detail})
             return
 
         job.status = "done"
         job.percent = 100
-        job.message = "Conversion complete"
-        emit({"type": "done", "status": "done", "percent": 100, "message": job.message})
+        emit({"type": "done", "status": "done", "percent": 100})
 
-    except Exception as e:
+    except Exception:
         job.status = "error"
-        job.err_detail = f"{type(e).__name__}: {repr(e)}\n\n{traceback.format_exc()}"
+        job.err_detail = traceback.format_exc()
         emit({
             "type": "error",
             "status": "error",
             "percent": job.percent,
-            "message": "Conversion error",
-            "detail": job.err_detail[-4000:],
+            "detail": (job.err_detail or "")[-4000:],
         })
-    finally:
-        try:
-            if in_path.exists():
-                in_path.unlink()
-        except Exception:
-            pass
 
 
 async def run_conversion(job: Job):
@@ -217,11 +252,8 @@ async def queue_worker():
     while True:
         job_id = await JOB_QUEUE.get()
         job = JOBS.get(job_id)
-        if not job:
-            JOB_QUEUE.task_done()
-            continue
-
-        await run_conversion(job)
+        if job:
+            await run_conversion(job)
         JOB_QUEUE.task_done()
 
 
@@ -232,53 +264,56 @@ async def startup():
         WORKER_STARTED = True
         asyncio.create_task(queue_worker())
 
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
 
 @app.post("/jobs")
 async def create_job(
     file: UploadFile = File(...),
     quality: int = Form(7),
 ):
-    if not file.filename.lower().endswith(".mp4"):
-        raise HTTPException(status_code=400, detail="Please upload an .mp4 file")
+    if not file.filename or not file.filename.lower().endswith(".mp4"):
+        raise HTTPException(400, "Only MP4 files supported")
     if quality < 1 or quality > 10:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 10")
+        raise HTTPException(400, "Quality must be between 1 and 10")
 
-    workdir = Path("/tmp")
+    # Make a safe-ish stem for download filename
+    orig_name = Path(file.filename).name
+    print(orig_name)
+    stem = Path(orig_name).stem or "converted"
+    print(stem)
+    stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", stem).strip() or "converted"
+    print(stem)
+    # Use a local tmp folder so it works consistently in PyInstaller
+    workdir = Path.cwd() / "tmp"
+    workdir.mkdir(exist_ok=True)
+
     job_id = str(uuid.uuid4())
     in_path = workdir / f"{job_id}.mp4"
     out_path = workdir / f"{job_id}.ogv"
 
-    # Save upload
     with open(in_path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
+        while chunk := await file.read(1024 * 1024):
             f.write(chunk)
 
     job = Job(
         job_id=job_id,
-        status="queued",
-        percent=0,
-        message="Queued",
-        queue_pos=0,
         in_path=in_path,
         out_path=out_path,
         quality=quality,
+        original_stem=stem,
     )
     JOBS[job_id] = job
-
-    waiting_before = JOB_QUEUE.qsize()
+    print(job)
+    pos = JOB_QUEUE.qsize() + 1
+    job.queue_pos = pos
     await JOB_QUEUE.put(job_id)
-    job.queue_pos = waiting_before + 1
 
-    # Emit queued status so client sees position
     await job.queue.put({
         "type": "status",
         "status": "queued",
-        "percent": 0,
-        "message": "Queued",
-        "queue_pos": job.queue_pos,
+        "queue_pos": pos,
     })
 
     return {"job_id": job_id}
@@ -288,41 +323,52 @@ async def create_job(
 async def job_events(job_id: str):
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404)
 
-    async def event_stream():
-        initial = {
-            "type": "status",
-            "status": job.status,
-            "percent": job.percent,
-            "message": job.message,
-            "queue_pos": job.queue_pos,
-        }
-        yield f"data: {json.dumps(initial)}\n\n"
-
+    async def stream():
+        yield f"data: {json.dumps({'type':'status','status':job.status,'queue_pos':job.queue_pos,'percent':job.percent})}\n\n"
         while True:
-            payload = await job.queue.get()
-            yield f"data: {json.dumps(payload)}\n\n"
-            if payload.get("type") in {"done", "error"}:
+            msg = await job.queue.get()
+            yield f"data: {json.dumps(msg)}\n\n"
+            if msg.get("type") in {"done", "error"}:
                 break
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.get("/jobs/{job_id}/download")
-async def job_download(job_id: str):
+async def download(job_id: str, background_tasks: BackgroundTasks):
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404, "Job not found")
 
     if job.status == "error":
-        raise HTTPException(status_code=500, detail=job.err_detail or "Conversion failed")
+        raise HTTPException(500, job.err_detail or "Conversion failed")
 
     if job.status != "done" or not job.out_path or not job.out_path.exists():
-        raise HTTPException(status_code=425, detail="Not ready yet")
+        raise HTTPException(425, "Not ready yet")
+
+    download_name = f"{job.original_stem}.ogv"
+    print(download_name)
+    # Cleanup files and remove job after the response is sent
+    background_tasks.add_task(cleanup_job_files, job_id)
 
     return FileResponse(
         path=str(job.out_path),
+        filename=download_name,
         media_type="video/ogg",
-        filename="converted.ogv",
     )
+
+# ---------------------------------------------------------------------------
+# Run as executable
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    def open_browser():
+        time.sleep(1)
+        webbrowser.open("http://127.0.0.1:8000")
+
+    threading.Thread(target=open_browser, daemon=True).start()
+
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
